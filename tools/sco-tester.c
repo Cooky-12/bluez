@@ -43,6 +43,8 @@ struct test_data {
 
 struct sco_client_data {
 	int expect_err;
+	const uint8_t *send_data;
+	uint16_t data_len;
 };
 
 static void print_debug(const char *str, void *user_data)
@@ -246,6 +248,14 @@ static const struct sco_client_data connect_success = {
 
 static const struct sco_client_data connect_failure = {
 	.expect_err = EOPNOTSUPP
+};
+
+const uint8_t data[] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+
+static const struct sco_client_data connect_send_success = {
+	.expect_err = 0,
+	.data_len = sizeof(data),
+	.send_data = data
 };
 
 static void client_connectable_complete(uint16_t opcode, uint8_t status,
@@ -517,7 +527,7 @@ end:
 
 static int create_sco_sock(struct test_data *data)
 {
-	const uint8_t *master_bdaddr;
+	const uint8_t *central_bdaddr;
 	struct sockaddr_sco addr;
 	int sk, err;
 
@@ -530,15 +540,15 @@ static int create_sco_sock(struct test_data *data)
 		return err;
 	}
 
-	master_bdaddr = hciemu_get_master_bdaddr(data->hciemu);
-	if (!master_bdaddr) {
-		tester_warn("No master bdaddr");
+	central_bdaddr = hciemu_get_central_bdaddr(data->hciemu);
+	if (!central_bdaddr) {
+		tester_warn("No central bdaddr");
 		return -ENODEV;
 	}
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sco_family = AF_BLUETOOTH;
-	bacpy(&addr.sco_bdaddr, (void *) master_bdaddr);
+	bacpy(&addr.sco_bdaddr, (void *) central_bdaddr);
 
 	if (bind(sk, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
 		err = -errno;
@@ -599,6 +609,20 @@ static gboolean sco_connect_cb(GIOChannel *io, GIOCondition cond,
 		tester_warn("Connect failed: %s (%d)", strerror(-err), -err);
 	else
 		tester_print("Successfully connected");
+
+	if (scodata->send_data) {
+		ssize_t ret;
+
+		tester_print("Writing %u bytes of data", scodata->data_len);
+
+		ret = write(sk, scodata->send_data, scodata->data_len);
+		if (scodata->data_len != ret) {
+			tester_warn("Failed to write %u bytes: %zu %s (%d)",
+					scodata->data_len, ret, strerror(errno),
+					errno);
+			err = -errno;
+		}
+	}
 
 	if (-err != scodata->expect_err)
 		tester_test_failed();
@@ -748,6 +772,9 @@ int main(int argc, char *argv[])
 
 	test_sco_11("SCO mSBC 1.1 - Failure", &connect_failure, setup_powered,
 							test_connect_transp);
+
+	test_sco("SCO CVSD Send - Success", &connect_send_success,
+					setup_powered, test_connect);
 
 	test_offload_sco("Basic SCO Get Socket Option - Offload - Success",
 				NULL, setup_powered, test_codecs_getsockopt);
