@@ -33,6 +33,7 @@
 #include "src/shared/ecc.h"
 #include "src/shared/queue.h"
 #include "monitor/bt.h"
+#include "monitor/msft.h"
 #include "btdev.h"
 
 #define AL_SIZE			16
@@ -139,6 +140,7 @@ struct btdev {
 	uint8_t  le_states[8];
 	const struct btdev_cmd *cmds;
 	uint16_t msft_opcode;
+	const struct btdev_cmd *msft_cmds;
 	bool aosp_capable;
 
 	uint16_t default_link_policy;
@@ -5122,9 +5124,10 @@ static void le_ext_conn_complete(struct btdev *btdev,
 
 		ev.status = status;
 		ev.peer_addr_type = btdev->le_scan_own_addr_type;
-		if (ev.peer_addr_type == 0x01)
+		if (ev.peer_addr_type == 0x01 || ev.peer_addr_type == 0x03) {
+			ev.peer_addr_type = 0x01;
 			memcpy(ev.peer_addr, btdev->random_addr, 6);
-		else
+		} else
 			memcpy(ev.peer_addr, btdev->bdaddr, 6);
 
 		ev.role = 0x01;
@@ -5132,6 +5135,11 @@ static void le_ext_conn_complete(struct btdev *btdev,
 		ev.interval = lecc->max_interval;
 		ev.latency = lecc->latency;
 		ev.supv_timeout = lecc->supv_timeout;
+
+		/* Set Local RPA if an RPA was generated for the advertising */
+		if (ext_adv->rpa)
+			memcpy(ev.local_rpa, ext_adv->random_addr,
+					sizeof(ev.local_rpa));
 
 		le_meta_event(conn->link->dev,
 				BT_HCI_EVT_LE_ENHANCED_CONN_COMPLETE, &ev,
@@ -5146,10 +5154,13 @@ static void le_ext_conn_complete(struct btdev *btdev,
 	memcpy(ev.peer_addr, cmd->peer_addr, 6);
 	ev.role = 0x00;
 
-	/* Set Local RPA if an RPA was generated for the advertising */
-	if (ext_adv->rpa)
-		memcpy(ev.local_rpa, ext_adv->random_addr,
-					sizeof(ev.local_rpa));
+	/* Use random address as Local RPA if Create Connection own_addr_type
+	 * is 0x03 since that expects the controller to generate the RPA.
+	 */
+	if (btdev->le_scan_own_addr_type == 0x03)
+		memcpy(ev.local_rpa, btdev->random_addr, 6);
+	else
+		memset(ev.local_rpa, 0, sizeof(ev.local_rpa));
 
 	le_meta_event(btdev, BT_HCI_EVT_LE_ENHANCED_CONN_COMPLETE, &ev,
 						sizeof(ev));
@@ -6236,7 +6247,7 @@ struct btdev *btdev_create(enum btdev_type type, uint16_t id)
 
 	btdev->type = type;
 	btdev->id = id;
-	btdev->manufacturer = 63;
+	btdev->manufacturer = 1521;
 	btdev->revision = 0x0000;
 
 	switch (btdev->type) {
@@ -6398,41 +6409,76 @@ static void num_completed_packets(struct btdev *btdev, uint16_t handle)
 	}
 }
 
+static const struct btdev_cmd *run_cmd(struct btdev *btdev,
+					const struct btdev_cmd *cmd,
+					const void *data, uint8_t len)
+{
+	uint8_t status = BT_HCI_ERR_UNKNOWN_COMMAND;
+	int err;
+
+	err = cmd->func(btdev, data, len);
+	switch (err) {
+	case 0:
+		return cmd;
+	case -ENOTSUP:
+		status = BT_HCI_ERR_UNKNOWN_COMMAND;
+		break;
+	case -EINVAL:
+		status = BT_HCI_ERR_INVALID_PARAMETERS;
+		break;
+	case -EPERM:
+		status = BT_HCI_ERR_COMMAND_DISALLOWED;
+		break;
+	default:
+		status = BT_HCI_ERR_UNSPECIFIED_ERROR;
+		break;
+	}
+
+	cmd_status(btdev, status, cmd->opcode);
+
+	return NULL;
+}
+
+static const struct btdev_cmd *msft_cmd(struct btdev *btdev, const void *data,
+								uint8_t len)
+{
+	const struct btdev_cmd *cmd;
+
+	for (cmd = btdev->msft_cmds; cmd->func; cmd++) {
+		if (cmd->opcode != ((uint8_t *)data)[0])
+			continue;
+
+		return run_cmd(btdev, cmd, data, len);
+	}
+
+	util_debug(btdev->debug_callback, btdev->debug_data,
+			"Unsupported MSFT subcommand 0x%2.2x\n",
+			((uint8_t *)data)[0]);
+
+	cmd_status(btdev, BT_HCI_ERR_UNKNOWN_COMMAND, btdev->msft_opcode);
+
+	return NULL;
+}
+
 static const struct btdev_cmd *default_cmd(struct btdev *btdev, uint16_t opcode,
 						const void *data, uint8_t len)
 {
 	const struct btdev_cmd *cmd;
-	uint8_t status = BT_HCI_ERR_UNKNOWN_COMMAND;
-	int err;
+
+	if (btdev->msft_opcode == opcode)
+		return msft_cmd(btdev, data, len);
 
 	for (cmd = btdev->cmds; cmd->func; cmd++) {
 		if (cmd->opcode != opcode)
 			continue;
 
-		err = cmd->func(btdev, data, len);
-		switch (err) {
-		case 0:
-			return cmd;
-		case -ENOTSUP:
-			status = BT_HCI_ERR_UNKNOWN_COMMAND;
-			goto failed;
-		case -EINVAL:
-			status = BT_HCI_ERR_INVALID_PARAMETERS;
-			goto failed;
-		case -EPERM:
-			status = BT_HCI_ERR_COMMAND_DISALLOWED;
-			goto failed;
-		default:
-			status = BT_HCI_ERR_UNSPECIFIED_ERROR;
-			goto failed;
-		}
+		return run_cmd(btdev, cmd, data, len);
 	}
 
 	util_debug(btdev->debug_callback, btdev->debug_data,
 			"Unsupported command 0x%4.4x\n", opcode);
 
-failed:
-	cmd_status(btdev, status, opcode);
+	cmd_status(btdev, BT_HCI_ERR_UNKNOWN_COMMAND, opcode);
 
 	return NULL;
 }
@@ -6677,14 +6723,174 @@ bool btdev_del_hook(struct btdev *btdev, enum btdev_hook_type type,
 	return false;
 }
 
+static int cmd_msft_read_features(struct btdev *dev, const void *data,
+							uint8_t len)
+{
+	struct msft_rsp_read_supported_features rsp;
+
+	memset(&rsp, 0, sizeof(rsp));
+	rsp.status = BT_HCI_ERR_SUCCESS;
+	rsp.subcmd = MSFT_SUBCMD_READ_SUPPORTED_FEATURES;
+	rsp.features[0] = MSFT_MONITOR_BREDR_RSSI | MSFT_MONITOR_LE_RSSI |
+				MSFT_MONITOR_LE_LEGACY_RSSI |
+				MSFT_MONITOR_LE_ADV |
+				MSFT_MONITOR_SSP_VALIDATION |
+				MSFT_MONITOR_LE_ADV_CONTINUOS;
+
+	cmd_complete(dev, dev->msft_opcode, &rsp, sizeof(rsp));
+
+	return 0;
+}
+
+static int cmd_msft_monitor_rssi(struct btdev *dev, const void *data,
+							uint8_t len)
+{
+	const struct msft_cmd_monitor_rssi *cmd = data;
+	struct msft_rsp_monitor_rssi rsp;
+	struct btdev_conn *conn;
+
+	memset(&rsp, 0, sizeof(rsp));
+	rsp.status = BT_HCI_ERR_SUCCESS;
+	rsp.subcmd = MSFT_SUBCMD_MONITOR_RSSI;
+
+	conn = queue_find(dev->conns, match_handle,
+				UINT_TO_PTR(le16_to_cpu(cmd->handle)));
+	if (!conn)
+		rsp.status = BT_HCI_ERR_UNKNOWN_CONN_ID;
+
+	cmd_complete(dev, dev->msft_opcode, &rsp, sizeof(rsp));
+
+	return 0;
+}
+
+static int cmd_msft_cancel_monitor_rssi(struct btdev *dev, const void *data,
+							uint8_t len)
+{
+	const struct msft_cmd_cancel_monitor_rssi *cmd = data;
+	struct msft_rsp_cancel_monitor_rssi rsp;
+	struct btdev_conn *conn;
+
+	memset(&rsp, 0, sizeof(rsp));
+	rsp.status = BT_HCI_ERR_SUCCESS;
+	rsp.subcmd = MSFT_SUBCMD_CANCEL_MONITOR_RSSI;
+
+	conn = queue_find(dev->conns, match_handle,
+				UINT_TO_PTR(le16_to_cpu(cmd->handle)));
+	if (!conn)
+		rsp.status = BT_HCI_ERR_UNKNOWN_CONN_ID;
+
+	cmd_complete(dev, dev->msft_opcode, &rsp, sizeof(rsp));
+
+	return 0;
+}
+
+static int cmd_msft_le_monitor_adv(struct btdev *dev, const void *data,
+							uint8_t len)
+{
+	const struct msft_cmd_le_monitor_adv *cmd = data;
+	struct msft_rsp_le_monitor_adv rsp;
+	static uint8_t handle;
+
+	memset(&rsp, 0, sizeof(rsp));
+	rsp.status = BT_HCI_ERR_SUCCESS;
+	rsp.subcmd = MSFT_SUBCMD_LE_MONITOR_ADV;
+
+	switch (cmd->type) {
+	case MSFT_LE_MONITOR_ADV_PATTERN:
+	case MSFT_LE_MONITOR_ADV_UUID:
+	case MSFT_LE_MONITOR_ADV_IRK:
+	case MSFT_LE_MONITOR_ADV_ADDR:
+		rsp.handle = handle++;
+		break;
+	default:
+		rsp.status = BT_HCI_ERR_INVALID_PARAMETERS;
+		break;
+	}
+
+	cmd_complete(dev, dev->msft_opcode, &rsp, sizeof(rsp));
+
+	return 0;
+}
+
+static int cmd_msft_le_cancel_monitor_adv(struct btdev *dev, const void *data,
+							uint8_t len)
+{
+	struct msft_rsp_le_cancel_monitor_adv rsp;
+
+	memset(&rsp, 0, sizeof(rsp));
+	rsp.status = BT_HCI_ERR_SUCCESS;
+	rsp.subcmd = MSFT_SUBCMD_LE_CANCEL_MONITOR_ADV;
+
+	cmd_complete(dev, dev->msft_opcode, &rsp, sizeof(rsp));
+
+	return 0;
+}
+
+static int cmd_msft_le_monitor_adv_enable(struct btdev *dev, const void *data,
+							uint8_t len)
+{
+	struct msft_rsp_le_cancel_monitor_adv rsp;
+
+	memset(&rsp, 0, sizeof(rsp));
+	rsp.status = BT_HCI_ERR_SUCCESS;
+	rsp.subcmd = MSFT_SUBCMD_LE_MONITOR_ADV_ENABLE;
+
+	cmd_complete(dev, dev->msft_opcode, &rsp, sizeof(rsp));
+
+	return 0;
+}
+
+static int cmd_msft_read_abs_rssi(struct btdev *dev, const void *data,
+							uint8_t len)
+{
+	struct msft_rsp_read_abs_rssi rsp;
+
+	memset(&rsp, 0, sizeof(rsp));
+	rsp.status = BT_HCI_ERR_SUCCESS;
+	rsp.subcmd = MSFT_SUBCMD_READ_ABS_RSSI;
+
+	cmd_complete(dev, dev->msft_opcode, &rsp, sizeof(rsp));
+
+	return 0;
+}
+
+#define CMD_MSFT \
+	CMD(MSFT_SUBCMD_READ_SUPPORTED_FEATURES, cmd_msft_read_features, \
+						NULL), \
+	CMD(MSFT_SUBCMD_MONITOR_RSSI, cmd_msft_monitor_rssi, NULL), \
+	CMD(MSFT_SUBCMD_CANCEL_MONITOR_RSSI, cmd_msft_cancel_monitor_rssi, \
+						NULL), \
+	CMD(MSFT_SUBCMD_LE_MONITOR_ADV, cmd_msft_le_monitor_adv, NULL),	\
+	CMD(MSFT_SUBCMD_LE_CANCEL_MONITOR_ADV, cmd_msft_le_cancel_monitor_adv, \
+						NULL), \
+	CMD(MSFT_SUBCMD_LE_MONITOR_ADV_ENABLE, cmd_msft_le_monitor_adv_enable, \
+						NULL), \
+	CMD(MSFT_SUBCMD_READ_ABS_RSSI, cmd_msft_read_abs_rssi, NULL)
+
+static const struct btdev_cmd cmd_msft[] = {
+	CMD_MSFT,
+	{}
+};
+
 int btdev_set_msft_opcode(struct btdev *btdev, uint16_t opcode)
 {
 	if (!btdev)
 		return -EINVAL;
 
-	btdev->msft_opcode = opcode;
-
-	return 0;
+	switch (btdev->type) {
+	case BTDEV_TYPE_BREDRLE:
+	case BTDEV_TYPE_BREDRLE50:
+	case BTDEV_TYPE_BREDRLE52:
+		btdev->msft_opcode = opcode;
+		btdev->msft_cmds = cmd_msft;
+		return 0;
+	case BTDEV_TYPE_BREDR:
+	case BTDEV_TYPE_LE:
+	case BTDEV_TYPE_AMP:
+	case BTDEV_TYPE_BREDR20:
+	default:
+		return -ENOTSUP;
+	}
 }
 
 int btdev_set_aosp_capable(struct btdev *btdev, bool enable)

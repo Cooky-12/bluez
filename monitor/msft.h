@@ -30,6 +30,13 @@ struct msft_cmd_read_supported_features {
 	uint8_t subcmd;
 } __attribute__((packed));
 
+#define MSFT_MONITOR_BREDR_RSSI			BIT(0)
+#define MSFT_MONITOR_LE_RSSI			BIT(1)
+#define MSFT_MONITOR_LE_LEGACY_RSSI		BIT(2)
+#define MSFT_MONITOR_LE_ADV			BIT(3)
+#define MSFT_MONITOR_SSP_VALIDATION		BIT(4)
+#define MSFT_MONITOR_LE_ADV_CONTINUOS		BIT(5)
+
 struct msft_rsp_read_supported_features {
 	uint8_t  status;
 	uint8_t  subcmd;
@@ -87,7 +94,7 @@ struct msft_le_monitor_adv_uuid {
 	union {
 		uint16_t u16;
 		uint32_t u32;
-		uint8_t  u128[8];
+		uint8_t  u128[16];
 	} value;
 } __attribute__((packed));
 
