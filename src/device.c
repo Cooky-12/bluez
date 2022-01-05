@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <time.h>
+#include <sys/stat.h>
 
 #include <glib.h>
 #include <dbus/dbus.h>
@@ -272,6 +273,8 @@ struct btd_device {
 
 	GIOChannel	*att_io;
 	guint		store_id;
+
+	time_t		name_resolve_failed_time;
 };
 
 static const uint16_t uuid_list[] = {
@@ -557,6 +560,59 @@ void device_store_cached_name(struct btd_device *dev, const char *name)
 			g_error_free(gerr);
 		}
 	}
+	g_free(data);
+	g_free(data_old);
+
+	g_key_file_free(key_file);
+}
+
+static void device_store_cached_name_resolve(struct btd_device *dev)
+{
+	char filename[PATH_MAX];
+	char d_addr[18];
+	GKeyFile *key_file;
+	GError *gerr = NULL;
+	char *data;
+	char *data_old;
+	gsize length = 0;
+	gsize length_old = 0;
+	uint64_t failed_time;
+
+	if (device_address_is_private(dev)) {
+		DBG("Can't store name resolve for private addressed device %s",
+								dev->path);
+		return;
+	}
+
+	ba2str(&dev->bdaddr, d_addr);
+	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/cache/%s",
+			btd_adapter_get_storage_dir(dev->adapter), d_addr);
+	create_file(filename, 0600);
+
+	key_file = g_key_file_new();
+	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
+		error("Unable to load key file from %s: (%s)", filename,
+								gerr->message);
+		g_error_free(gerr);
+	}
+
+	failed_time = (uint64_t) dev->name_resolve_failed_time;
+
+	data_old = g_key_file_to_data(key_file, &length_old, NULL);
+
+	g_key_file_set_uint64(key_file, "NameResolving", "FailedTime",
+								failed_time);
+
+	data = g_key_file_to_data(key_file, &length, NULL);
+
+	if ((length != length_old) || (memcmp(data, data_old, length))) {
+		if (!g_file_set_contents(filename, data, length, &gerr)) {
+			error("Unable set contents for %s: (%s)", filename,
+								gerr->message);
+			g_error_free(gerr);
+		}
+	}
+
 	g_free(data);
 	g_free(data_old);
 
@@ -1403,23 +1459,7 @@ void device_set_wake_override(struct btd_device *device, bool wake_override)
 	}
 }
 
-void device_set_wake_allowed(struct btd_device *device, bool wake_allowed,
-			     GDBusPendingPropertySet id)
-{
-	/* Pending and current value are the same unless there is a change in
-	 * progress. Only update wake allowed if pending value doesn't match the
-	 * new value.
-	 */
-	if (wake_allowed == device->pending_wake_allowed)
-		return;
-
-	device->wake_id = id;
-	device->pending_wake_allowed = wake_allowed;
-	adapter_set_device_wakeable(device_get_adapter(device), device,
-				    wake_allowed);
-}
-
-void device_set_wake_allowed_complete(struct btd_device *device)
+static void device_set_wake_allowed_complete(struct btd_device *device)
 {
 	if (device->wake_id != -1U) {
 		g_dbus_pending_property_success(device->wake_id);
@@ -1433,6 +1473,50 @@ void device_set_wake_allowed_complete(struct btd_device *device)
 	store_device_info(device);
 }
 
+static void set_wake_allowed_complete(uint8_t status, uint16_t length,
+					 const void *param, void *user_data)
+{
+	const struct mgmt_rp_set_device_flags *rp = param;
+	struct btd_device *dev = user_data;
+
+	if (status != MGMT_STATUS_SUCCESS) {
+		error("Set device flags return status: %s",
+					mgmt_errstr(status));
+		return;
+	}
+
+	if (length < sizeof(*rp)) {
+		error("Too small Set Device Flags complete event: %d", length);
+		return;
+	}
+
+	device_set_wake_allowed_complete(dev);
+}
+
+void device_set_wake_allowed(struct btd_device *device, bool wake_allowed,
+			     GDBusPendingPropertySet id)
+{
+	uint32_t flags;
+
+	/* Pending and current value are the same unless there is a change in
+	 * progress. Only update wake allowed if pending value doesn't match the
+	 * new value.
+	 */
+	if (wake_allowed == device->pending_wake_allowed)
+		return;
+
+	device->wake_id = id;
+	device->pending_wake_allowed = wake_allowed;
+
+	flags = device->current_flags;
+	if (wake_allowed)
+		flags |= DEVICE_FLAG_REMOTE_WAKEUP;
+	else
+		flags &= ~DEVICE_FLAG_REMOTE_WAKEUP;
+
+	adapter_set_device_flags(device->adapter, device, flags,
+					set_wake_allowed_complete, device);
+}
 
 static gboolean
 dev_property_get_wake_allowed(const GDBusPropertyTable *property,
@@ -3272,6 +3356,32 @@ failed:
 	return str;
 }
 
+static void load_cached_name_resolve(struct btd_device *device,
+					const char *local, const char *peer)
+{
+	char filename[PATH_MAX];
+	GKeyFile *key_file;
+	uint64_t failed_time;
+
+	if (device_address_is_private(device))
+		return;
+
+	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/cache/%s", local, peer);
+
+	key_file = g_key_file_new();
+
+	if (!g_key_file_load_from_file(key_file, filename, 0, NULL))
+		goto failed;
+
+	failed_time = g_key_file_get_uint64(key_file, "NameResolving",
+							"FailedTime", NULL);
+
+	device->name_resolve_failed_time = failed_time;
+
+failed:
+	g_key_file_free(key_file);
+}
+
 static struct csrk_info *load_csrk(GKeyFile *key_file, const char *group)
 {
 	struct csrk_info *csrk;
@@ -3505,6 +3615,7 @@ static void load_att_info(struct btd_device *device, const char *local,
 				const char *peer)
 {
 	char filename[PATH_MAX];
+	struct stat st;
 	GKeyFile *key_file;
 	GError *gerr = NULL;
 	char *prim_uuid, *str;
@@ -3514,11 +3625,12 @@ static void load_att_info(struct btd_device *device, const char *local,
 	char tmp[3];
 	int i;
 
-	sdp_uuid16_create(&uuid, GATT_PRIM_SVC_UUID);
-	prim_uuid = bt_uuid2string(&uuid);
-
 	snprintf(filename, PATH_MAX, STORAGEDIR "/%s/%s/attributes", local,
 			peer);
+
+	/* Check if attributes file exists */
+	if (stat(filename, &st) < 0)
+		return;
 
 	key_file = g_key_file_new();
 	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
@@ -3527,6 +3639,9 @@ static void load_att_info(struct btd_device *device, const char *local,
 		g_error_free(gerr);
 	}
 	groups = g_key_file_get_groups(key_file, NULL);
+
+	sdp_uuid16_create(&uuid, GATT_PRIM_SVC_UUID);
+	prim_uuid = bt_uuid2string(&uuid);
 
 	for (handle = groups; *handle; handle++) {
 		gboolean uuid_ok;
@@ -4279,6 +4394,7 @@ struct btd_device *device_create(struct btd_adapter *adapter,
 	struct btd_device *device;
 	char dst[18];
 	char *str;
+	const char *storage_dir;
 
 	ba2str(bdaddr, dst);
 	DBG("dst %s", dst);
@@ -4294,12 +4410,14 @@ struct btd_device *device_create(struct btd_adapter *adapter,
 	else
 		device->le = true;
 
-	str = load_cached_name(device, btd_adapter_get_storage_dir(adapter),
-									dst);
+	storage_dir = btd_adapter_get_storage_dir(adapter);
+	str = load_cached_name(device, storage_dir, dst);
 	if (str) {
 		strcpy(device->name, str);
 		g_free(str);
 	}
+
+	load_cached_name_resolve(device, storage_dir, dst);
 
 	return device;
 }
@@ -4361,6 +4479,35 @@ bool device_name_known(struct btd_device *device)
 	return device->name[0] != '\0';
 }
 
+bool device_is_name_resolve_allowed(struct btd_device *device)
+{
+	struct timespec now;
+
+	if (!device)
+		return false;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+
+	/* If now < failed_time, it means the clock has somehow turned back,
+	 * possibly because of system restart. Allow name request in this case.
+	 */
+	return now.tv_sec < device->name_resolve_failed_time ||
+		now.tv_sec >= device->name_resolve_failed_time +
+					btd_opts.name_request_retry_delay;
+}
+
+void device_name_resolve_fail(struct btd_device *device)
+{
+	struct timespec now;
+
+	if (!device)
+		return;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	device->name_resolve_failed_time = now.tv_sec;
+	device_store_cached_name_resolve(device);
+}
+
 void device_set_class(struct btd_device *device, uint32_t class)
 {
 	if (device->class == class)
@@ -4381,6 +4528,8 @@ void device_set_class(struct btd_device *device, uint32_t class)
 void device_update_addr(struct btd_device *device, const bdaddr_t *bdaddr,
 							uint8_t bdaddr_type)
 {
+	bool auto_connect = device->auto_connect;
+
 	if (!bacmp(bdaddr, &device->bdaddr) &&
 					bdaddr_type == device->bdaddr_type)
 		return;
@@ -4389,6 +4538,12 @@ void device_update_addr(struct btd_device *device, const bdaddr_t *bdaddr,
 	 * Resolving purposes we can now assume LE is supported.
 	 */
 	device->le = true;
+
+	/* Remove old address from accept/auto-connect list since its address
+	 * will be changed.
+	 */
+	if (auto_connect)
+		device_set_auto_connect(device, FALSE);
 
 	bacpy(&device->bdaddr, bdaddr);
 	device->bdaddr_type = bdaddr_type;
@@ -4399,6 +4554,9 @@ void device_update_addr(struct btd_device *device, const bdaddr_t *bdaddr,
 						DEVICE_INTERFACE, "Address");
 	g_dbus_emit_property_changed(dbus_conn, device->path,
 					DEVICE_INTERFACE, "AddressType");
+
+	if (auto_connect)
+		device_set_auto_connect(device, TRUE);
 }
 
 void device_set_bredr_support(struct btd_device *device)
@@ -4998,22 +5156,28 @@ static void update_bredr_services(struct browse_req *req, sdp_list_t *recs)
 
 	snprintf(sdp_file, PATH_MAX, STORAGEDIR "/%s/cache/%s", srcaddr,
 								dstaddr);
+	create_file(sdp_file, 0600);
 
 	sdp_key_file = g_key_file_new();
 	if (!g_key_file_load_from_file(sdp_key_file, sdp_file, 0, &gerr)) {
 		error("Unable to load key file from %s: (%s)", sdp_file,
 								gerr->message);
-		g_error_free(gerr);
+		g_clear_error(&gerr);
+		g_key_file_free(sdp_key_file);
+		sdp_key_file = NULL;
 	}
 
 	snprintf(att_file, PATH_MAX, STORAGEDIR "/%s/%s/attributes", srcaddr,
 								dstaddr);
+	create_file(att_file, 0600);
 
 	att_key_file = g_key_file_new();
 	if (!g_key_file_load_from_file(att_key_file, att_file, 0, &gerr)) {
 		error("Unable to load key file from %s: (%s)", att_file,
 								gerr->message);
-		g_error_free(gerr);
+		g_clear_error(&gerr);
+		g_key_file_free(att_key_file);
+		att_key_file = NULL;
 	}
 
 	for (seq = recs; seq; seq = seq->next) {
@@ -5068,12 +5232,11 @@ next:
 	if (sdp_key_file) {
 		data = g_key_file_to_data(sdp_key_file, &length, NULL);
 		if (length > 0) {
-			create_file(sdp_file, 0600);
 			if (!g_file_set_contents(sdp_file, data, length,
 								&gerr)) {
 				error("Unable set contents for %s: (%s)",
 						sdp_file, gerr->message);
-				g_error_free(gerr);
+				g_clear_error(&gerr);
 			}
 		}
 
@@ -5084,12 +5247,11 @@ next:
 	if (att_key_file) {
 		data = g_key_file_to_data(att_key_file, &length, NULL);
 		if (length > 0) {
-			create_file(att_file, 0600);
 			if (!g_file_set_contents(att_file, data, length,
 								&gerr)) {
 				error("Unable set contents for %s: (%s)",
 						att_file, gerr->message);
-				g_error_free(gerr);
+				g_clear_error(&gerr);
 			}
 		}
 

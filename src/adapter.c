@@ -3779,8 +3779,6 @@ static struct smp_ltk_info *get_ltk(GKeyFile *key_file, const char *peer,
 					uint8_t peer_type, const char *group)
 {
 	struct smp_ltk_info *ltk = NULL;
-	GError *gerr = NULL;
-	bool central;
 	char *key;
 	char *rand = NULL;
 
@@ -3836,12 +3834,6 @@ static struct smp_ltk_info *get_ltk(GKeyFile *key_file, const char *peer,
 									NULL);
 	ltk->ediv = g_key_file_get_integer(key_file, group, "EDiv", NULL);
 
-	central = g_key_file_get_boolean(key_file, group, "Master", &gerr);
-	if (gerr)
-		g_error_free(gerr);
-	else
-		ltk->central = central;
-
 	ltk->is_blocked = is_blocked_key(HCI_BLOCKED_KEY_TYPE_LTK,
 								ltk->val);
 
@@ -3868,7 +3860,14 @@ static struct smp_ltk_info *get_peripheral_ltk_info(GKeyFile *key_file,
 
 	DBG("%s", peer);
 
-	ltk = get_ltk(key_file, peer, bdaddr_type, "SlaveLongTermKey");
+	/* Peripheral* is the proper term, but for now read both entries
+	 * so it won't break when user up/downgrades. Remove the other
+	 * term after a few releases.
+	 */
+	ltk = get_ltk(key_file, peer, bdaddr_type, "PeripheralLongTermKey");
+	if (!ltk)
+		ltk = get_ltk(key_file, peer, bdaddr_type, "SlaveLongTermKey");
+
 	if (ltk)
 		ltk->central = false;
 
@@ -5309,6 +5308,23 @@ void adapter_accept_list_remove(struct btd_adapter *adapter,
 				remove_accept_list_complete, adapter, NULL);
 }
 
+static void set_device_privacy_complete(uint8_t status, uint16_t length,
+					 const void *param, void *user_data)
+{
+	const struct mgmt_rp_set_device_flags *rp = param;
+
+	if (status != MGMT_STATUS_SUCCESS) {
+		error("Set device flags return status: %s",
+					mgmt_errstr(status));
+		return;
+	}
+
+	if (length < sizeof(*rp)) {
+		error("Too small Set Device Flags complete event: %d", length);
+		return;
+	}
+}
+
 static void add_device_complete(uint8_t status, uint16_t length,
 					const void *param, void *user_data)
 {
@@ -5343,6 +5359,18 @@ static void add_device_complete(uint8_t status, uint16_t length,
 	}
 
 	DBG("%s (%u) added to kernel connect list", addr, rp->addr.type);
+
+	if (btd_opts.device_privacy) {
+		uint32_t flags = btd_device_get_current_flags(dev);
+
+		/* Set Device Privacy Mode has not set the flag yet. */
+		if (!(flags & DEVICE_FLAG_DEVICE_PRIVACY)) {
+			adapter_set_device_flags(adapter, dev, flags |
+						DEVICE_FLAG_DEVICE_PRIVACY,
+						set_device_privacy_complete,
+						NULL);
+		}
+	}
 }
 
 void adapter_auto_connect_add(struct btd_adapter *adapter,
@@ -5384,42 +5412,9 @@ void adapter_auto_connect_add(struct btd_adapter *adapter,
 	adapter->connect_list = g_slist_append(adapter->connect_list, device);
 }
 
-static void set_device_wakeable_complete(uint8_t status, uint16_t length,
-					 const void *param, void *user_data)
-{
-	const struct mgmt_rp_set_device_flags *rp = param;
-	struct btd_adapter *adapter = user_data;
-	struct btd_device *dev;
-	char addr[18];
-
-	if (status != MGMT_STATUS_SUCCESS) {
-		btd_error(adapter->dev_id, "Set device flags return status: %s",
-			  mgmt_errstr(status));
-		return;
-	}
-
-	if (length < sizeof(*rp)) {
-		btd_error(adapter->dev_id,
-			  "Too small Set Device Flags complete event: %d",
-			  length);
-		return;
-	}
-
-	ba2str(&rp->addr.bdaddr, addr);
-
-	dev = btd_adapter_find_device(adapter, &rp->addr.bdaddr, rp->addr.type);
-	if (!dev) {
-		btd_error(adapter->dev_id,
-			  "Set Device Flags complete for unknown device %s",
-			  addr);
-		return;
-	}
-
-	device_set_wake_allowed_complete(dev);
-}
-
-void adapter_set_device_wakeable(struct btd_adapter *adapter,
-				 struct btd_device *device, bool wakeable)
+void adapter_set_device_flags(struct btd_adapter *adapter,
+				struct btd_device *device, uint32_t flags,
+				mgmt_request_func_t func, void *user_data)
 {
 	struct mgmt_cp_set_device_flags cp;
 	const bdaddr_t *bdaddr;
@@ -5434,14 +5429,10 @@ void adapter_set_device_wakeable(struct btd_adapter *adapter,
 	memset(&cp, 0, sizeof(cp));
 	bacpy(&cp.addr.bdaddr, bdaddr);
 	cp.addr.type = bdaddr_type;
-	cp.current_flags = btd_device_get_current_flags(device);
-	if (wakeable)
-		cp.current_flags |= DEVICE_FLAG_REMOTE_WAKEUP;
-	else
-		cp.current_flags &= ~DEVICE_FLAG_REMOTE_WAKEUP;
+	cp.current_flags = cpu_to_le32(flags);
 
 	mgmt_send(adapter->mgmt, MGMT_OP_SET_DEVICE_FLAGS, adapter->dev_id,
-		  sizeof(cp), &cp, set_device_wakeable_complete, adapter, NULL);
+		  sizeof(cp), &cp, func, user_data, NULL);
 }
 
 static void device_flags_changed_callback(uint16_t index, uint16_t length,
@@ -5900,7 +5891,6 @@ static void convert_ltk_entry(GKeyFile *key_file, void *value)
 	g_free(str);
 
 	g_key_file_set_integer(key_file, "LongTermKey", "Authenticated", auth);
-	g_key_file_set_integer(key_file, "LongTermKey", "Master", central);
 	g_key_file_set_integer(key_file, "LongTermKey", "EncSize", enc_size);
 	g_key_file_set_integer(key_file, "LongTermKey", "EDiv", ediv);
 
@@ -6984,12 +6974,14 @@ static bool device_is_discoverable(struct btd_adapter *adapter,
 	return discoverable;
 }
 
-static void update_found_devices(struct btd_adapter *adapter,
+void btd_adapter_update_found_device(struct btd_adapter *adapter,
 					const bdaddr_t *bdaddr,
 					uint8_t bdaddr_type, int8_t rssi,
 					bool confirm, bool legacy,
 					bool not_connectable,
-					const uint8_t *data, uint8_t data_len)
+					bool name_resolve_failed,
+					const uint8_t *data, uint8_t data_len,
+					bool monitoring)
 {
 	struct btd_device *dev;
 	struct bt_ad *ad = NULL;
@@ -6999,20 +6991,24 @@ static void update_found_devices(struct btd_adapter *adapter,
 	bool duplicate = false;
 	struct queue *matched_monitors = NULL;
 
-	if (bdaddr_type != BDADDR_BREDR)
-		ad = bt_ad_new_with_data(data_len, data);
+	if (!btd_adv_monitor_offload_supported(adapter->adv_monitor_manager)) {
+		if (bdaddr_type != BDADDR_BREDR)
+			ad = bt_ad_new_with_data(data_len, data);
 
-	/* During the background scanning, update the device only when the data
-	 * match at least one Adv monitor
-	 */
-	if (ad) {
-		matched_monitors = btd_adv_monitor_content_filter(
-					adapter->adv_monitor_manager, ad);
-		bt_ad_unref(ad);
-		ad = NULL;
+		/* During the background scanning, update the device only when
+		 * the data match at least one Adv monitor
+		 */
+		if (ad) {
+			matched_monitors = btd_adv_monitor_content_filter(
+						adapter->adv_monitor_manager,
+						ad);
+			bt_ad_unref(ad);
+			ad = NULL;
+			monitoring = matched_monitors ? true : false;
+		}
 	}
 
-	if (!adapter->discovering && !matched_monitors)
+	if (!adapter->discovering && !monitoring)
 		return;
 
 	memset(&eir_data, 0, sizeof(eir_data));
@@ -7025,7 +7021,7 @@ static void update_found_devices(struct btd_adapter *adapter,
 
 	dev = btd_adapter_find_device(adapter, bdaddr, bdaddr_type);
 	if (!dev) {
-		if (!discoverable && !matched_monitors) {
+		if (!discoverable && !monitoring) {
 			eir_data_free(&eir_data);
 			return;
 		}
@@ -7064,7 +7060,7 @@ static void update_found_devices(struct btd_adapter *adapter,
 	 */
 	if (!btd_device_is_connected(dev) &&
 		(device_is_temporary(dev) && !adapter->discovery_list) &&
-		!matched_monitors) {
+		!monitoring) {
 		eir_data_free(&eir_data);
 		return;
 	}
@@ -7072,7 +7068,7 @@ static void update_found_devices(struct btd_adapter *adapter,
 	/* If there is no matched Adv monitors, don't continue if not
 	 * discoverable or if active discovery filter don't match.
 	 */
-	if (!matched_monitors && (!discoverable ||
+	if (!monitoring && (!discoverable ||
 		(adapter->filtered_discovery && !is_filter_match(
 				adapter->discovery_list, &eir_data, rssi)))) {
 		eir_data_free(&eir_data);
@@ -7080,6 +7076,9 @@ static void update_found_devices(struct btd_adapter *adapter,
 	}
 
 	device_set_legacy(dev, legacy);
+
+	if (name_resolve_failed)
+		device_name_resolve_fail(dev);
 
 	if (adapter->filtered_discovery)
 		device_set_rssi_with_delta(dev, rssi, 0);
@@ -7151,7 +7150,10 @@ static void update_found_devices(struct btd_adapter *adapter,
 	if (g_slist_find(adapter->discovery_found, dev))
 		return;
 
-	if (confirm)
+	/* If name is unknown but it's not allowed to resolve, don't send
+	 * MGMT_OP_CONFIRM_NAME.
+	 */
+	if (confirm && (name_known || device_is_name_resolve_allowed(dev)))
 		confirm_name(adapter, bdaddr, bdaddr_type, name_known);
 
 	adapter->discovery_found = g_slist_prepend(adapter->discovery_found,
@@ -7201,6 +7203,8 @@ static void device_found_callback(uint16_t index, uint16_t length,
 	uint32_t flags;
 	bool confirm_name;
 	bool legacy;
+	bool not_connectable;
+	bool name_resolve_failed;
 	char addr[18];
 
 	if (length < sizeof(*ev)) {
@@ -7230,11 +7234,14 @@ static void device_found_callback(uint16_t index, uint16_t length,
 
 	confirm_name = (flags & MGMT_DEV_FOUND_CONFIRM_NAME);
 	legacy = (flags & MGMT_DEV_FOUND_LEGACY_PAIRING);
+	not_connectable = (flags & MGMT_DEV_FOUND_NOT_CONNECTABLE);
+	name_resolve_failed = (flags & MGMT_DEV_FOUND_NAME_REQUEST_FAILED);
 
-	update_found_devices(adapter, &ev->addr.bdaddr, ev->addr.type,
-					ev->rssi, confirm_name, legacy,
-					flags & MGMT_DEV_FOUND_NOT_CONNECTABLE,
-					eir, eir_len);
+	btd_adapter_update_found_device(adapter, &ev->addr.bdaddr,
+					ev->addr.type, ev->rssi, confirm_name,
+					legacy, not_connectable,
+					name_resolve_failed, eir, eir_len,
+					false);
 }
 
 struct agent *adapter_get_agent(struct btd_adapter *adapter)
@@ -8415,13 +8422,12 @@ static void new_link_key_callback(uint16_t index, uint16_t length,
 	bonding_complete(adapter, &addr->bdaddr, addr->type, 0);
 }
 
-static void store_longtermkey(struct btd_adapter *adapter, const bdaddr_t *peer,
+static void store_ltk_group(struct btd_adapter *adapter, const bdaddr_t *peer,
 				uint8_t bdaddr_type, const unsigned char *key,
-				uint8_t central, uint8_t authenticated,
+				const char *group, uint8_t authenticated,
 				uint8_t enc_size, uint16_t ediv,
 				uint64_t rand)
 {
-	const char *group = central ? "LongTermKey" : "SlaveLongTermKey";
 	char device_addr[18];
 	char filename[PATH_MAX];
 	GKeyFile *key_file;
@@ -8430,11 +8436,6 @@ static void store_longtermkey(struct btd_adapter *adapter, const bdaddr_t *peer,
 	gsize length = 0;
 	char *str;
 	int i;
-
-	if (central != 0x00 && central != 0x01) {
-		error("Unsupported LTK type %u", central);
-		return;
-	}
 
 	ba2str(peer, device_addr);
 
@@ -8446,9 +8447,6 @@ static void store_longtermkey(struct btd_adapter *adapter, const bdaddr_t *peer,
 								gerr->message);
 		g_error_free(gerr);
 	}
-
-	/* Old files may contain this so remove it in case it exists */
-	g_key_file_remove_key(key_file, "LongTermKey", "Master", NULL);
 
 	for (i = 0; i < 16; i++)
 		sprintf(key_str + (i * 2), "%2.2X", key[i]);
@@ -8473,6 +8471,34 @@ static void store_longtermkey(struct btd_adapter *adapter, const bdaddr_t *peer,
 	g_free(str);
 
 	g_key_file_free(key_file);
+}
+
+static void store_longtermkey(struct btd_adapter *adapter, const bdaddr_t *peer,
+				uint8_t bdaddr_type, const unsigned char *key,
+				uint8_t central, uint8_t authenticated,
+				uint8_t enc_size, uint16_t ediv,
+				uint64_t rand)
+{
+	if (central != 0x00 && central != 0x01) {
+		error("Unsupported LTK type %u", central);
+		return;
+	}
+
+	if (central) {
+		store_ltk_group(adapter, peer, bdaddr_type, key, "LongTermKey",
+				authenticated, enc_size, ediv, rand);
+	} else {
+		/* Peripheral* is the proper term, but for now keep duplicates
+		 * so it won't break when user up/downgrades. Remove the other
+		 * term after a few releases.
+		 */
+		store_ltk_group(adapter, peer, bdaddr_type, key,
+				"PeripheralLongTermKey", authenticated,
+				enc_size, ediv, rand);
+		store_ltk_group(adapter, peer, bdaddr_type, key,
+				"SlaveLongTermKey", authenticated,
+				enc_size, ediv, rand);
+	}
 }
 
 static void new_long_term_key_callback(uint16_t index, uint16_t length,
