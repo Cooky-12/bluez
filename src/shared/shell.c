@@ -678,7 +678,6 @@ int bt_shell_release_prompt(const char *input)
 
 static void rl_handler(char *input)
 {
-	wordexp_t w;
 	HIST_ENTRY *last;
 
 	if (!input) {
@@ -703,16 +702,8 @@ static void rl_handler(char *input)
 	if (data.monitor)
 		bt_log_printf(0xffff, data.name, LOG_INFO, "%s", input);
 
-	if (wordexp(input, &w, WRDE_NOCMD))
-		goto done;
+	bt_shell_exec(input);
 
-	if (w.we_wordc == 0) {
-		wordfree(&w);
-		goto done;
-	}
-
-	shell_exec(w.we_wordc, w.we_wordv);
-	wordfree(&w);
 done:
 	free(input);
 }
@@ -1178,6 +1169,29 @@ int bt_shell_run(void)
 	return status;
 }
 
+int bt_shell_exec(const char *input)
+{
+	wordexp_t w;
+	int err;
+
+	if (!input)
+		return 0;
+
+	if (wordexp(input, &w, WRDE_NOCMD))
+		return -ENOEXEC;
+
+	if (w.we_wordc == 0) {
+		wordfree(&w);
+		return -ENOEXEC;
+	}
+
+	err = shell_exec(w.we_wordc, w.we_wordv);
+
+	wordfree(&w);
+
+	return err;
+}
+
 void bt_shell_cleanup(void)
 {
 	bt_shell_release_prompt("");
@@ -1233,6 +1247,9 @@ bool bt_shell_add_submenu(const struct bt_shell_menu *menu)
 {
 	if (!menu)
 		return false;
+
+	if (!data.main)
+		return bt_shell_set_menu(menu);
 
 	if (!data.submenus)
 		data.submenus = queue_new();

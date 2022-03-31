@@ -14,6 +14,7 @@
 #include <alloca.h>
 #include <byteswap.h>
 #include <string.h>
+#include <sys/types.h>
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 #define BIT(n)  (1 << (n))
@@ -102,6 +103,8 @@ void util_hexdump(const char dir, const unsigned char *buf, size_t len,
 				util_debug_func_t function, void *user_data);
 
 unsigned char util_get_dt(const char *parent, const char *name);
+
+ssize_t util_getrandom(void *buf, size_t buflen, unsigned int flags);
 
 uint8_t util_get_uid(uint64_t *bitmap, uint8_t max);
 void util_clear_uid(uint64_t *bitmap, uint8_t id);
